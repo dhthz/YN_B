@@ -1,0 +1,10 @@
+#Ignore the virtual environment
+ypologistikiEnv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore environment configuration files
+.env
