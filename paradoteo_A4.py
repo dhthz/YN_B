@@ -29,7 +29,70 @@ def create_model(input_shape, hidden_units, learning_rate, momentum, l2_lambda):
     return model
 
 
-def train_NN_full_dataset():
+def plot_convergence(histories, lr, momentum, l2_lambda):
+    plt.figure(figsize=(10, 6))
+    min_epochs = min(len(h.history['loss']) for h in histories)
+    train_losses = np.array([h.history['loss'][:min_epochs]
+                            for h in histories])
+    val_losses = np.array([h.history['val_loss'][:min_epochs]
+                          for h in histories])
+
+    avg_train_loss = np.mean(train_losses, axis=0)
+    avg_val_loss = np.mean(val_losses, axis=0)
+
+    plt.plot(avg_train_loss, label='Train Loss')
+    plt.plot(avg_val_loss, label='Validation Loss')
+    plt.title(
+        f'Average Loss Convergence (lr={lr}, m={momentum}, l2={l2_lambda})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f'plots/convergence_lr{lr}_m{momentum}_l2{l2_lambda}.png')
+    plt.close()
+
+
+def plot_feature_importance(model, feature_names, mode):
+    # Get weights from first layer
+    first_layer_weights = model.layers[0].get_weights()[0]
+
+    # Calculate importance as mean absolute weight
+    feature_importance = np.mean(np.abs(first_layer_weights), axis=1)
+
+    if (mode == 1):
+        plt.figure(figsize=(10, 6))
+        plt.bar(feature_names, feature_importance,
+                color='skyblue', edgecolor='black')
+        plt.title('Feature Importance')
+        plt.xlabel('Features')
+        plt.ylabel('Importance')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+    else:
+        importance_list = feature_importance.tolist()
+        feature_list = list(feature_names)
+
+        # Create pairs and sort
+        feature_pairs = list(zip(feature_list, importance_list))
+        feature_pairs.sort(key=lambda x: x[1], reverse=True)
+
+        # Get top 10
+        top_10 = feature_pairs[:10]
+        top_features = [pair[0] for pair in top_10]
+        top_importance = [pair[1] for pair in top_10]
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(top_features, top_importance,
+                color='lightcoral', edgecolor='black')
+        plt.title('Top 10 Most Important Features')
+        plt.xlabel('Features')
+        plt.ylabel('Importance')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+
+def train_NN_full_dataset(mode=0):
     # Fixed hyperparameters
     hidden_units = 76
     learning_rate = 0.05
@@ -37,8 +100,6 @@ def train_NN_full_dataset():
     l2_lambda = 0.0001
 
     FILE = "alzheimers_disease_data.csv"
-    if not os.path.exists('plots'):
-        os.makedirs('plots')
 
     try:
         df = pd.read_csv(FILE, encoding="utf-8")
@@ -64,9 +125,17 @@ def train_NN_full_dataset():
         df = pd.get_dummies(
             df, columns=["EducationLevel"], prefix="EducationLevel")
 
-        # Prepare data
-        dataForTargetColumn = df.drop(
-            columns=['PatientID', 'Diagnosis', 'DoctorInCharge'])
+        # mode = 0 trains NN with whole dataset and mode = 1 trains with the features selected by the GA
+        if (mode == 0):
+            dataForTargetColumn = df.drop(
+                columns=['PatientID', 'Diagnosis', 'DoctorInCharge'])
+            selected_features = dataForTargetColumn
+        else:
+            selected_features = ['SleepQuality', 'CardiovascularDisease', 'CholesterolLDL', 'MMSE',
+                                 'FunctionalAssessment', 'MemoryComplaints', 'BehavioralProblems', 'ADL']
+
+            dataForTargetColumn = df[selected_features]
+
         targetColumn = df['Diagnosis']
         dataForTargetColumn = dataForTargetColumn.to_numpy().astype('float32')
         targetColumn = targetColumn.to_numpy().astype('float32')
@@ -117,6 +186,9 @@ def train_NN_full_dataset():
             val_accuracies.append(val_metrics[1])
             histories.append(history)
 
+        if (mode == 1):
+            plot_convergence(histories, learning_rate, momentum, l2_lambda)
+
         results = {
             'Train Accuracy': np.mean(fold_accuracies),
             'Train Loss': np.mean(fold_losses),
@@ -125,12 +197,10 @@ def train_NN_full_dataset():
             'Validation Accuracy': np.mean(val_accuracies)
         }
 
-        results_df = pd.DataFrame([{
-            'Learning Rate': learning_rate,
-            'Momentum': momentum,
-            'L2': l2_lambda,
-            **results
-        }])
+        plot_feature_importance(model, selected_features, mode=mode)
+
+        for res in results:
+            print(f"{res}: {results[res]:.4f}")
 
         return model
     except Exception as e:

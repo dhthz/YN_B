@@ -15,7 +15,7 @@ from keras.src.regularizers import L2
 import matplotlib.pyplot as plt
 import os
 import warnings
-from paradoteo_A4 import train_nn_full_dataset
+from paradoteo_A4 import train_NN_full_dataset
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.filterwarnings('ignore')
 
@@ -24,7 +24,6 @@ tf.get_logger().setLevel('ERROR')
 
 class GeneticAlgorithmWithNN:
     def __init__(self, population_size, chromosome_length, crossover_prob, mutation_prob, elitism_ratio, min_hamming_distance):
-        # Αρχικοποίηση παραμέτρων ΓΑ
         self.population_size = population_size
         self.chromosome_length = chromosome_length
         self.crossover_prob = crossover_prob
@@ -45,11 +44,9 @@ class GeneticAlgorithmWithNN:
             attempts = 0
             while attempts < max_attempts:
                 attempts += 1
-                # Δημιουργία τυχαίου χρωμοσώματος
                 chromosome = [random.randint(0, 1)
                               for _ in range(self.chromosome_length)]
 
-                # Έλεγχος κανόνων
                 num_ones = sum(chromosome)
                 if num_ones >= 2 and num_ones < self.chromosome_length:
                     if len(population) == 0 or all(GeneticAlgorithmWithNN.hamming_distance(chromosome, existing) >= self.min_hamming_distance for existing in population):
@@ -67,287 +64,290 @@ class GeneticAlgorithmWithNN:
 
         return population
 
-    def fitness_function(self, chromosome, model, data, target, penalty_multiplier=0.05, accuracy_multiplier=0.95):
-        """
-        Fitness function using accuracy instead of cross-entropy loss.
-        Lower fitness = better performance (minimization problem).
-        """
+    def fitness_function(self, chromosome, model, data, target, original_columns, penalty_weight=0.05, accuracy_weight=0.95):
         accuracy = GeneticAlgorithmWithNN.evaluate_nn_fixed_weights(
-            model, data, target, chromosome)
+            model, data, target, chromosome, original_columns)
         num_active_features = sum(chromosome)
 
-        # Penalty for using more features
-        penalty = (num_active_features / len(chromosome))
+        # Penalty for using more features (0 to 1 range)
+        penalty = (num_active_features / len(chromosome)) * penalty_weight
 
-        # Convert accuracy to error rate for minimization
-        error_rate = 1 - accuracy  # Error rate: 0 is perfect, 1 is worst
-
-        # Combine error rate and penalty (both should be minimized)
-        fitness = accuracy_multiplier * error_rate + penalty_multiplier * penalty
+        # Weighted accuracy minus penalty (higher = better)
+        fitness = accuracy_weight * accuracy - penalty
 
         return fitness
 
     @staticmethod
-    def evaluate_nn_fixed_weights(model, data, target, chromosome):
-        # Get original feature names
-        original_features = data.columns.tolist()
-        selected_original_features = [feature for feature, bit in zip(
-            original_features, chromosome) if bit == 1]
+    def evaluate_nn_fixed_weights(model, processed_data, target, chromosome, original_columns):
+        processed_features = [col for col in processed_data.columns
+                              if col not in ['PatientID', 'Diagnosis', 'DoctorInCharge']]
 
-        # Always preprocess with ALL features
-        preprocessor = preprocessing_pipeline(data, chromosome=None)
-        X = preprocessor.fit_transform(data)
+        X = processed_data[processed_features].values.astype('float32')
         y = target.values
 
-        # Get preprocessed feature names
-        feature_names = preprocessor.get_feature_names_out()
+        # Create mapping from original columns to processed columns
+        mapping, _ = create_original_to_processed_mapping(
+            original_columns, processed_data)
 
-        # Create mask for preprocessed features
-        mask = np.zeros(len(feature_names), dtype=bool)
-
-        for i, feature_name in enumerate(feature_names):
-            # Check if this preprocessed feature corresponds to a selected original feature
-            for selected_feature in selected_original_features:
-                if selected_feature in feature_name:
-                    mask[i] = True
-                    break
-
-        # Apply mask
+        # Apply chromosome selection
         X_masked = X.copy()
-        X_masked[:, ~mask] = 0
+
+        # For each chromosome bit
+        for chromosome_idx, bit in enumerate(chromosome):
+            if bit == 0 and chromosome_idx in mapping:
+                # If this original feature is not selected, zero out all corresponding processed columns
+                processed_column_indices = mapping[chromosome_idx]
+                for col_idx in processed_column_indices:
+                    X_masked[:, col_idx] = 0
 
         # Evaluate
         y_pred = model.predict(X_masked, verbose=0)
-        accuracy = np.mean((y_pred > 0.5).astype(int) == y)
+        if len(y_pred.shape) > 1:
+            y_pred = y_pred.flatten()
 
+        accuracy = np.mean((y_pred > 0.5).astype(int) == y)
         return accuracy
 
-    def evolve(self, population, model, data, target):
-        # Evaluate fitness for each chromosome in the population
+    def evolve(self, population, model, data, target, original_columns):
+        # Evaluate fitness for each chromosome
         fitness_scores = [self.fitness_function(
-            chromosome, model, data, target) for chromosome in population]
+            chromosome, model, data, target, original_columns) for chromosome in population]
 
-        # Perform elitism: Retain the best individuals
+        # Perform elitism: Retain the best individuals (HIGHEST fitness)
         num_elites = int(self.elitism_ratio * self.population_size)
         elites = sorted(zip(population, fitness_scores),
-                        key=lambda x: x[1])[:num_elites]
-        next_population = [elite[0]
-                           for elite in elites]  # Retain elite chromosomes
+                        # REVERSE=True for maximization
+                        key=lambda x: x[1], reverse=True)[:num_elites]
+        next_population = [elite[0] for elite in elites]
 
         # Generate new individuals through crossover and mutation
         while len(next_population) < self.population_size:
-            # Select two parents randomly
-            parent1 = random.choice(population)
-            parent2 = random.choice(population)
+            parent1 = self.tournament_selection(
+                population, fitness_scores, tournament_size=3)
+            parent2 = self.tournament_selection(
+                population, fitness_scores, tournament_size=3)
 
-            # Perform uniform crossover
             offspring = [
                 parent1[i] if random.random(
                 ) < self.crossover_prob else parent2[i]
                 for i in range(self.chromosome_length)
             ]
 
-            # Perform mutation
             for i in range(self.chromosome_length):
                 if random.random() < self.mutation_prob:
-                    # Flip the bit (0 → 1, 1 → 0)
                     offspring[i] = 1 - offspring[i]
 
             next_population.append(offspring)
 
         return next_population
 
-    def run_fixed_weights_multiple_runs(self, runs, max_generations, data, target, hidden_units, learning_rate, momentum, l2_lambda, patience=10, min_improvement=0.01):
-        """
-        Εκτέλεση του ΓΑ για πολλαπλά τρεξίματα και υπολογισμός μέσου όρου της καλύτερης τιμής fitness ανά γενιά.
-        """
-        # Train the NN once with the full dataset
-        model = train_nn_full_dataset()
+    @staticmethod
+    def tournament_selection(population, fitness_scores, tournament_size=3):
+        # Randomly select tournament_size individuals
+        tournament_indices = random.sample(
+            range(len(population)), tournament_size)
 
-        all_best_fitness = []  # Αποθήκευση της καλύτερης τιμής fitness ανά γενιά για κάθε τρέξιμο
-        # Track the actual number of generations for each run
+        # Find the best fitness in tournament (higher = better for maximization)
+        best_idx = max(tournament_indices, key=lambda i: fitness_scores[i])
+
+        return population[best_idx]
+
+    def run_fixed_weights_multiple_runs(self, runs, max_generations, processed_data, target, original_columns, patience=10, min_improvement=0.01):
+
+        model = train_NN_full_dataset()
+
+        all_best_fitness_per_run = []
+        all_best_fitness_evolution = []
         actual_generations_per_run = []
-        best_chromosome_overall = None  # Track the best chromosome across all runs
-        # Track the best fitness across all runs
-        best_fitness_overall = float('inf')
+        best_chromosome_overall = None
+        best_fitness_overall = float('-inf')
+
+        print(f"    Doing {runs} runs:")
 
         for run in range(runs):
-            print(f"Run {run + 1}/{runs}")
+            print(f"      Run {run + 1}/{runs}...", end="")
 
-            # Initialize population for this run
             population = self.initialize_population()
             best_fitness_per_generation = []
             no_generation_improvement_counter = 0
-            previous_best_fitness = float('inf')
+            previous_best_fitness = float('-inf')
 
             for generation in range(max_generations):
-                # Evaluate fitness for each chromosome using the fixed weights
                 fitness_scores = [self.fitness_function(
-                    chromosome, model, data, target) for chromosome in population]
-                # Get the best fitness (minimization)
-                best_fitness = min(fitness_scores)
-                best_fitness_per_generation.append(best_fitness)
+                    chromosome, model, processed_data, target, original_columns) for chromosome in population]
 
-                # Track the best chromosome across all runs
-                best_chromosome_index = fitness_scores.index(best_fitness)
+                best_fitness_this_generation = max(fitness_scores)
+                best_fitness_per_generation.append(
+                    best_fitness_this_generation)
+
+                best_chromosome_index = fitness_scores.index(
+                    best_fitness_this_generation)
                 best_chromosome = population[best_chromosome_index]
-                if best_fitness < best_fitness_overall:
-                    best_fitness_overall = best_fitness
+
+                if best_fitness_this_generation > best_fitness_overall:
+                    best_fitness_overall = best_fitness_this_generation
                     best_chromosome_overall = best_chromosome
 
-                # Check improvement
-                improvement = previous_best_fitness - best_fitness
+                improvement = best_fitness_this_generation - previous_best_fitness
                 if improvement < min_improvement:
                     no_generation_improvement_counter += 1
                 else:
                     no_generation_improvement_counter = 0
 
-                previous_best_fitness = best_fitness
+                previous_best_fitness = best_fitness_this_generation
 
-                # Termination criteria
+                # Early stopping
                 if no_generation_improvement_counter >= patience:
-                    print(
-                        f"Τερματισμός: Το καλύτερο άτομο δεν βελτιώθηκε για {patience} γενιές.")
-                    # Track the actual number of generations
                     actual_generations_per_run.append(generation + 1)
                     break
-                if generation >= max_generations - 1:
-                    print(
-                        f"Τερματισμός: Έχει ξεπεραστεί ο μέγιστος αριθμός γενεών ({max_generations}).")
-                    # Track the actual number of generations
+                elif generation >= max_generations - 1:
                     actual_generations_per_run.append(max_generations)
                     break
 
-                # Evolve population
-                population = self.evolve(population, model, data, target)
+                population = self.evolve(
+                    population, model, processed_data, target, original_columns)
 
-            # Store the best fitness values for this run
-            all_best_fitness.append(best_fitness_per_generation)
+            all_best_fitness_evolution.append(
+                best_fitness_per_generation)
+            all_best_fitness_per_run.append(
+                best_fitness_this_generation)
+            print(
+                f" Finished in {len(best_fitness_per_generation)} generations")
 
-        # Compute average best fitness across runs
         max_actual_generations = max(actual_generations_per_run)
-        padded_fitness = []
-        for fitness_list in all_best_fitness:
+
+        padded_best_fitness = []
+        for fitness_list in all_best_fitness_evolution:
             if len(fitness_list) < max_actual_generations:
-                # Pad with the last fitness value
                 last_value = fitness_list[-1]
                 padded_list = fitness_list + \
                     [last_value] * (max_actual_generations - len(fitness_list))
-                padded_fitness.append(padded_list)
+                padded_best_fitness.append(padded_list)
             else:
-                padded_fitness.append(fitness_list)
-        avg_best_fitness = np.mean(all_best_fitness, axis=0)
-        # Extract selected features from the best chromosome
+                padded_best_fitness.append(fitness_list)
+
+        avg_best_fitness_evolution = np.mean(padded_best_fitness, axis=0)
+
+        avg_best_fitness_final = np.mean(all_best_fitness_per_run)
+
         selected_features = [feature for feature, bit in zip(
-            data.columns, best_chromosome_overall) if bit == 1]
+            original_columns, best_chromosome_overall) if bit == 1]
+        num_selected_features = len(selected_features)
 
-        print(f"\nBest Chromosome Overall: {best_chromosome_overall}")
-        print(f"Best Fitness Overall: {best_fitness_overall}")
-        print(f"Selected Features: {selected_features}")
+        print(
+            f"    Finished: {num_selected_features} features were selected")
+        print(
+            f"    Average Best Fitness from  {runs} runs: {avg_best_fitness_final:.4f}")
 
-        return avg_best_fitness, max_actual_generations, best_chromosome_overall, selected_features
+        return {
+            # for plotting
+            'avg_best_fitness_evolution': avg_best_fitness_evolution,
+            'avg_best_fitness_final': avg_best_fitness_final,
+            'generations': max_actual_generations,
+            'best_chromosome': best_chromosome_overall,
+            'selected_features': selected_features,
+            'num_features': num_selected_features,
+            'best_fitness_overall': best_fitness_overall,
+            'all_runs_fitness': all_best_fitness_per_run
+        }
 
 
-def plot_evolution_curve(avg_best_fitness, generations, test_case):
-    """
-    Σχεδίαση της καμπύλης εξέλιξης (απόδοση/αριθμός γενεών).
-    """
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, generations + 1), avg_best_fitness,
-             marker='o', label='Average Best Fitness')
-    plt.title(
-        f"Evolution Curve (Population: {test_case['population_size']}, Crossover: {test_case['crossover_prob']}, Mutation: {test_case['mutation_prob']})")
-    plt.xlabel("Generations")
-    plt.ylabel("Fitness")
-    plt.legend()
-    plt.grid()
+def create_original_to_processed_mapping(original_columns, processed_df):
+    # Get processed feature columns (exclude non-features)
+    processed_features = [col for col in processed_df.columns
+                          if col not in ['PatientID', 'Diagnosis', 'DoctorInCharge']]
+    mapping = {}
+    for i, original_col in enumerate(original_columns):
+        # chromosome index -> list of processed column indices
+        mapping[i] = []
+        if original_col in ['EducationLevel', 'Ethnicity']:
+            # Find all processed columns that start with this name
+            for j, processed_col in enumerate(processed_features):
+                if processed_col.startswith(original_col + '_'):
+                    mapping[i].append(j)
+        else:
+            # Direct mapping for regular features
+            if original_col in processed_features:
+                j = processed_features.index(original_col)
+                mapping[i].append(j)
+    return mapping, processed_features
 
-    # Dynamically name the PNG file
-    filename = f"evolution_curve_pop_{test_case['population_size']}_cross_{test_case['crossover_prob']}_mut_{test_case['mutation_prob']}.png"
-    plt.savefig(filename)
+
+def plot_evolution_curve(results, test_case):
+    plt.figure(figsize=(12, 8))
+
+    x = np.array(range(1, results['generations'] + 1))
+    y = results['avg_best_fitness_evolution']
+
+    if len(x) >= 4:
+        try:
+            from scipy.interpolate import make_interp_spline
+            x_smooth = np.linspace(x.min(), x.max(), 300)
+            spl = make_interp_spline(x, y, k=3)
+            y_smooth = spl(x_smooth)
+
+            plt.plot(x_smooth, y_smooth, linewidth=4, color='blue', alpha=0.8,
+                     label=f'Avg Best Fitness')
+            plt.scatter(x, y, color='darkblue', s=50, zorder=5, alpha=0.8)
+        except ImportError:
+            plt.plot(x, y, 'o-', linewidth=3, markersize=8, color='blue',
+                     label=f'Avg Best Fitness')
+    else:
+        plt.plot(x, y, 'o-', linewidth=3, markersize=10, color='blue',
+                 label=f'Avg Best Fitness')
+
+    # Formatting
+    plt.title(f"Evolution Curve (10 Runs)\n"
+              f"Population: {test_case['population_size']}, Crossover: {test_case['crossover_prob']}, "
+              f"Mutation: {test_case['mutation_prob']}", fontsize=14, fontweight='bold')
+
+    plt.xlabel("Number of generations", fontsize=12)
+    plt.ylabel("Avg Best Fitness", fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+
+    avg_final = results['avg_best_fitness_final']
+
+    stats_text = f'Generations: {results["generations"]}\n'
+    stats_text += f'Starting Fitness: {y[0]:.4f}\n'
+    stats_text += f'Final Fitness: {y[-1]:.4f}\n'
+    stats_text += f'Average (10 runs): {avg_final:.4f}\n'
+    stats_text += f'Characteristics: {results["num_features"]}\n'
+    stats_text += f'Selected: {", ".join(results["selected_features"][:3])}{"..." if len(results["selected_features"]) > 3 else ""}'
+
+    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8),
+             fontsize=10)
+
+    plt.tight_layout()
+
+    filename = f"evolution_avg_pop_{test_case['population_size']}_cross_{test_case['crossover_prob']}_mut_{test_case['mutation_prob']}.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.show()
 
 
-def preprocessing_pipeline(data, chromosome):
-    data = data.copy()
-    # Convert all numeric columns to float32
-    numeric_columns = data.select_dtypes(include=['float64', 'int64']).columns
-    data[numeric_columns] = data[numeric_columns].astype('float32')
-
-    # Convert integer categorical columns to categorical type
-    data['EducationLevel'] = data['EducationLevel'].astype("category")
-    data['Ethnicity'] = data['Ethnicity'].astype("category")
-
-    # Feature selection based on chrosome, if its not provided use all features
-    if chromosome is not None:
-        selected_features = [feature for feature, bit in zip(
-            data.columns, chromosome) if bit == 1]
-    else:
-        selected_features = data.columns
-
-    # Define preprocessing rules as a dictionary
-    preprocessing_rules = {
-        'normalize': ['AlcoholConsumption', 'PhysicalActivity', 'DietQuality', 'SleepQuality', 'ADL'],
-        'standardize': ['Age', 'BMI', 'SystolicBP', 'DiastolicBP', 'CholesterolTotal', 'CholesterolLDL',
-                        'CholesterolHDL', 'CholesterolTriglycerides', 'MMSE', 'FunctionalAssessment'],
-        'encode': ['EducationLevel', 'Ethnicity']
-    }
-
-    # Filter preprocessing rules based on selected features
-    columns_for_normalization = [
-        col for col in preprocessing_rules['normalize'] if col in selected_features]
-    columns_for_standardization = [
-        col for col in preprocessing_rules['standardize'] if col in selected_features]
-    columns_for_encoding = [
-        col for col in preprocessing_rules['encode'] if col in selected_features]
-
-    # Pipeline for normalization
-    normalization_pipeline = Pipeline([
-        ('normalizer', MinMaxScaler(feature_range=(0, 1)))  # Normalization
-    ])
-
-    # Pipeline for standardization
-    standardization_pipeline = Pipeline([
-        ('scaler', StandardScaler())  # Standardization
-    ])
-
-    # Pipeline for categorical features
-    categorical_pipeline = Pipeline([
-        # One-hot encoding
-        ('encoder', OneHotEncoder(drop='first', sparse_output=False))
-    ])
-
-    # Combine pipelines using ColumnTransformer
-    preprocessor = ColumnTransformer([
-        ('normalize', normalization_pipeline, columns_for_normalization),
-        ('standardize', standardization_pipeline, columns_for_standardization),
-        ('categorical', categorical_pipeline, columns_for_encoding)
-    ])
-
-    return preprocessor
-
-
 if __name__ == "__main__":
-    # Φόρτωση δεδομένων
     random.seed(42)
     np.random.seed(42)
     tf.random.set_seed(42)
-    df = pd.read_csv("alzheimers_disease_data.csv")
-    target_column = df['Diagnosis']
-    df = df.drop(columns=['PatientID', 'Diagnosis', 'DoctorInCharge'])
 
-    # Υπερπαράμετροι ΝΝ
-    hidden_units = 76
-    learning_rate = 0.05
-    momentum = 0.6
-    l2_lambda = 0.0001
+    original_df = pd.read_csv("alzheimers_disease_data.csv")
+    original_columns = [col for col in original_df.columns
+                        if col not in ['PatientID', 'Diagnosis', 'DoctorInCharge']]
 
-    # Υπερπαράμετροι ΓΑ
-    chromosome_length = df.shape[1]
+    processed_df = pd.read_csv("processed_data.csv")
+    target_column = processed_df['Diagnosis']
+    processed_df = processed_df.drop(
+        columns=['PatientID', 'Diagnosis', 'DoctorInCharge'])
+    original_df = original_df.drop(
+        columns=['PatientID', 'Diagnosis', 'DoctorInCharge'])
+
+    # GA hyperparameters
+    chromosome_length = original_df.shape[1]
     max_generations = 100
     patience = 10
     min_improvement = 0.01
-    runs = 10  # Αριθμός τρεξιμάτων
+    runs = 10
 
     test_cases = [
         {"population_size": 20, "crossover_prob": 0.6, "mutation_prob": 0.00},
@@ -362,53 +362,65 @@ if __name__ == "__main__":
         {"population_size": 200, "crossover_prob": 0.1, "mutation_prob": 0.01},
     ]
 
-    # Results storage
-    results = []
+    global_best_fitness = float('-inf')
+    global_best_test_case = None
     global_best_chromosome = None
-    global_best_fitness = float('inf')
     global_selected_features = None
-    for idx, test_case in enumerate(test_cases, start=1):
-        print(f"\nRunning Test Case {idx}: {test_case}")
 
-        # Δημιουργία ΓΑ
+    for idx, test_case in enumerate(test_cases, start=1):
+        print(f"\n{'='*60}")
+        print(f"Test Case {idx}/{len(test_cases)}: Pop={test_case['population_size']}, "
+              f"Cross={test_case['crossover_prob']}, Mut={test_case['mutation_prob']}")
+        print(f"{'='*60}")
+
+        # Create and run GA
         ga = GeneticAlgorithmWithNN(
             population_size=test_case["population_size"],
             chromosome_length=chromosome_length,
             crossover_prob=test_case["crossover_prob"],
             mutation_prob=test_case["mutation_prob"],
-            elitism_ratio=0.1,  # Fixed elitism ratio
+            elitism_ratio=0.1,
             min_hamming_distance=2
         )
 
-        # Εκτέλεση ΓΑ για πολλαπλά τρεξίματα
-        avg_best_fitness, generations, best_chromosome, selected_features = ga.run_fixed_weights_multiple_runs(
-            runs, max_generations, df, target_column, hidden_units, learning_rate, momentum, l2_lambda, patience, min_improvement
+        results = ga.run_fixed_weights_multiple_runs(
+            runs, max_generations, processed_df, target_column, original_columns,
+            patience, min_improvement
         )
 
-        if avg_best_fitness[-1] < global_best_fitness:
-            global_best_fitness = avg_best_fitness[-1]
-            global_best_chromosome = best_chromosome
-            global_selected_features = selected_features
+        # Plots after 10 runs
+        plot_evolution_curve(results, test_case)
 
-        # Σχεδίαση καμπύλης εξέλιξης
-        plot_evolution_curve(avg_best_fitness, generations, test_case)
+        # Store results using the AVERAGE fitness from 10 runs
+        estimated_accuracy = (results['avg_best_fitness_final'] + 0.05) / 0.95
+        feature_reduction_percent = (
+            1 - results['num_features'] / len(original_columns)) * 100
 
-        # Αποθήκευση αποτελεσμάτων
-        results.append({
-            "Test Case": idx,
-            "Population Size": test_case["population_size"],
-            "Crossover Probability": test_case["crossover_prob"],
-            "Mutation Probability": test_case["mutation_prob"],
-            # Final fitness value
-            "Average Best Fitness": avg_best_fitness[-1],
-            "Average Generations": len(avg_best_fitness)  # Total generations
-        })
+        csv_row = {
+            'Test_Case_ID': idx,
+            'Population_Size': test_case["population_size"],
+            'Crossover_Prob': test_case["crossover_prob"],
+            'Mutation_Prob': test_case["mutation_prob"],
+            'Avg_Best_Fitness': results['avg_best_fitness_final'],
+            'Best_Fitness_Overall': results['best_fitness_overall'],
+            'Estimated_Accuracy': f"{estimated_accuracy:.1%}",
+            'Features_Selected': results['num_features'],
+            'Total_Features': len(original_columns),
+            'Feature_Reduction': f"{feature_reduction_percent:.1%}",
+            'Generations': results['generations'],
+            'Selected_Features': '|'.join(results['selected_features'])
+        }
+        # Update global best using AVERAGE fitness
+        if results['avg_best_fitness_final'] > global_best_fitness:
+            global_best_fitness = results['avg_best_fitness_final']
+            global_best_test_case = idx
+            global_best_chromosome = results['best_chromosome']
+            global_selected_features = results['selected_features']
 
-    # Print results
-    print(
-        f"\nGlobal Best Chromosome:{global_best_chromosome} and best fitness: {global_best_fitness}")
-    results_df = pd.DataFrame(results)
-    results_df.to_csv("ga_results.csv", index=False)
-    print("\nResults:")
-    for result in results:
-        print(result)
+        # Quick status
+        print(f"  Avg Fitness (10 runs): {results['avg_best_fitness_final']:.4f}, "
+              f"Best Overall: {results['best_fitness_overall']:.4f}, "
+              f"Features: {results['num_features']}")
+
+    # Trains the NN with the selected columns from the GA
+    train_NN_full_dataset(mode=1)
